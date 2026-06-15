@@ -979,18 +979,6 @@ async def handle_all(msg: Message):
             await send(msg.peer_id, f"Текст принят ({len(docs)} шт.).", kb_collect())
         return
 
-    if st.get("tbl") and sec is None:
-        docs = batch.get(uid, [])
-        if atts:
-            docs += [a for a in atts if a["type"] in ("image","document")]
-            batch[uid] = docs
-            await send(msg.peer_id, f"Принято ({len(docs)}). Ещё или ✅ Обработать.", kb_collect())
-        elif text:
-            docs.append({"type": "text", "text": text})
-            batch[uid] = docs
-            await send(msg.peer_id, f"Принято.", kb_collect())
-        return
-
     # ── ПОДПИСКИ ─────────────────────────────────────────────────
     if sec == "subs":
         docs_in = [a for a in atts if a["type"] in ("image","document")]
@@ -1185,7 +1173,7 @@ async def handle_all(msg: Message):
             sp = sheets_retry(gc.open_by_key, SP_NUTR)
             sheets_retry(sp.sheet1.append_row, [
                 str(int(time.time())), str(uid), _now().isoformat(),
-                d.get("meal_name",""), "",
+                d.get("meal_name",""),
                 fmt(d.get("kcal")), fmt(d.get("protein")),
                 fmt(d.get("fat")), fmt(d.get("carbs"))])
             await send(msg.peer_id,
