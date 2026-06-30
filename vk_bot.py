@@ -306,7 +306,13 @@ def kb_main():
     return kb(["₽ Финучёт", "▶ Календарь"],
               ["📚 База знаний", "📦 Заказы"],
               ["📋 Задачи", "🔧 Полезное"],
-              ["🍎 Питание"])
+              ["👤 Личное", "🔍 Поиск по базе"])
+
+# Раздел «Личное» — как в Telegram-боте.
+# Питание уже есть; Рефлексия и Мои поездки пока заглушки до портирования.
+def kb_lichnoe():
+    return kb(["🍎 Питание", "🪞 Рефлексия"],
+              ["🌍 Мои поездки", "◀ Главная"])
 
 def kb_fin():
     return kb(["Таблица 1 (ДДС)", "Таблица 2 (КУДиР)"],
@@ -520,6 +526,37 @@ async def go_useful(msg: Message):
     if not allowed(msg.from_id): return
     clear(msg.from_id)
     await send(msg.peer_id, "Полезное:", kb_useful())
+
+@bot.on.message(text="👤 Личное")
+async def go_lichnoe(msg: Message):
+    if not allowed(msg.from_id): return
+    clear(msg.from_id)
+    await send(msg.peer_id, "👤 Личное:", kb_lichnoe())
+
+@bot.on.message(text="🪞 Рефлексия")
+async def go_reflection_stub(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id,
+               "🪞 Рефлексия в VK ещё не подключена — она есть в Telegram, "
+               "переношу следующим заходом. Пока пиши заметки туда.",
+               kb_lichnoe())
+
+@bot.on.message(text="🌍 Мои поездки")
+async def go_travel_stub(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id,
+               "🌍 Мои поездки в VK ещё не подключены — они есть в Telegram, "
+               "переношу следующим заходом.",
+               kb_lichnoe())
+
+@bot.on.message(text="🔍 Поиск по базе")
+async def go_search_stub(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id,
+               "🔍 Поиск по базе знаний (Notion) в VK пока не подключён. "
+               "В Telegram он работает — там быстрый и глубокий поиск по инструкциям. "
+               "Переношу следующим заходом.",
+               kb_main())
 
 @bot.on.message(text="◀ Финучёт")
 async def back_fin(msg: Message):
