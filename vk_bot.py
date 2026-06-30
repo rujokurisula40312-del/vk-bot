@@ -80,6 +80,9 @@ NOTION_PARENT     = _e("NOTION_PARENT_PAGE_ID")
 
 NUTR_OWNER        = int(_e("NUTRITION_OWNER_USER_ID", "0"))
 
+UON_API_KEY       = _e("UON_API_KEY")
+UON_ACCOUNT_ID    = _e("UON_ACCOUNT_ID")
+
 # ══════════════════════════════════════════════════════════════════
 # ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
 # ══════════════════════════════════════════════════════════════════
@@ -326,7 +329,14 @@ def kb_know():
 
 def kb_orders():
     return kb(["Добавить туриста", "Найти туриста"],
-              ["База туристов", "◀ Главная"])
+              ["База туристов", "🔎 U-ON"],
+              ["◀ Главная"])
+
+# Подменю U-ON: поиск и оперативные дайджесты заявок.
+def kb_uon():
+    return kb(["🔎 Поиск заявки", "📋 Брони сегодня"],
+              ["✈️ Вылеты", "🛬 Возвращения"],
+              ["📊 Дедлайны ТО", "◀ Заказы"])
 
 def kb_tasks():
     return kb(["Новая задача", "Все задачи"],
@@ -334,7 +344,8 @@ def kb_tasks():
               ["◀ Главная"])
 
 def kb_useful():
-    return kb(["🔐 Пароли", "◀ Главная"])
+    return kb(["🔐 Пароли", "💱 Курс валют"],
+              ["◀ Главная"])
 
 def kb_cancel():
     return kb(["❌ Отмена"])
@@ -1048,6 +1059,36 @@ async def handle_all(msg: Message):
             await send(msg.peer_id, f"Ошибка: {e}")
         return
 
+    # ── U-ON: поиск заявки ───────────────────────────────────────
+    if sec == "uon" and step == "uon_query":
+        if not text: return
+        if len(text) < 2:
+            await send(msg.peer_id, "Минимум 2 символа. Попробуй ещё раз:")
+            return
+        await send(msg.peer_id, f"⏳ Ищу «{text}» в U-ON…")
+        try:
+            leads = await uon_search(text)
+        except Exception as e:
+            log.error(f"uon_search: {e}")
+            await send(msg.peer_id, f"Ошибка U-ON: {e}", kb_uon())
+            states.pop(uid, None)
+            return
+        states.pop(uid, None)
+        if not leads:
+            await send(msg.peer_id, "Ничего не нашлось.", kb_uon())
+            return
+        if len(leads) > 5:
+            await send(msg.peer_id, f"Найдено {len(leads)}, показываю первые 5:")
+        for ld in leads[:5]:
+            await send(msg.peer_id, fmt_lead_card_vk(ld))
+        if len(leads) > 5:
+            await send(msg.peer_id,
+                       f"…и ещё {len(leads) - 5}. Уточни запрос если нужно.",
+                       kb_uon())
+        else:
+            await send(msg.peer_id, "—", kb_uon())
+        return
+
     # ── ГИДЫ: поиск ──────────────────────────────────────────────
     if sec == "guide_search":
         if not text: return
@@ -1505,6 +1546,681 @@ async def handle_passes(msg: Message, uid, text, st):
             await send(peer, f"Ошибка: {e}")
         states[uid] = {"sec":"passes","step":"menu"}
         await send(peer, "Менеджер паролей.", kb_passes())
+
+
+# ══════════════════════════════════════════════════════════════════
+# U-ON TRAVEL CRM (read-only port из finance-bot, один аккаунт)
+# ══════════════════════════════════════════════════════════════════
+
+UON_BASE = "https://api.u-on.ru"
+UON_SCAN_PAGES = 60
+UON_SCAN_PAGES_DEEP = 200
+uon_leads_cache_vk: dict[int, dict[str, dict]] = {}
+
+def uon_configured() -> bool:
+    return bool(UON_API_KEY and UON_ACCOUNT_ID)
+
+def uon_lead_url(lead_id) -> str:
+    if not UON_ACCOUNT_ID or not lead_id: return ""
+    return f"https://id{UON_ACCOUNT_ID}.u-on.ru/request_edit.php?r_id={lead_id}"
+
+async def _uon_get(s, path):
+    """GET к U-ON. На 'нет данных' API возвращает 404 с валидным JSON-телом."""
+    url = f"{UON_BASE}/{UON_API_KEY}/{path}"
+    try:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            txt = await r.text()
+            try: data = json.loads(txt)
+            except Exception: data = None
+            if r.status == 200 and data is not None: return data
+            if r.status == 404 and isinstance(data, dict): return data
+            return None
+    except Exception as e:
+        log.debug(f"_uon_get {path}: {e}")
+        return None
+
+async def _uon_post(s, path, payload):
+    url = f"{UON_BASE}/{UON_API_KEY}/{path}"
+    try:
+        async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            txt = await r.text()
+            try: data = json.loads(txt)
+            except Exception: data = None
+            if r.status in (200, 404) and isinstance(data, dict): return data
+            return None
+    except Exception as e:
+        log.debug(f"_uon_post {path}: {e}")
+        return None
+
+def _u_as_list(v):
+    if v is None: return []
+    if isinstance(v, list): return v
+    if isinstance(v, dict): return [v]
+    return []
+
+def _u_pick(d, *keys):
+    if not isinstance(d, dict): return ""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", 0, "0", "0.00"): return v
+    return ""
+
+def _u_digits(s):
+    return "".join(ch for ch in str(s or "") if ch.isdigit())
+
+def _u_normalize_phone(p):
+    d = _u_digits(p)
+    if len(d) == 11 and d[0] in ("7", "8"): d = d[1:]
+    return d
+
+def _u_classify(phrase):
+    raw = (phrase or "").strip()
+    digits = _u_digits(raw)
+    has_alpha = any(ch.isalpha() for ch in raw)
+    if has_alpha and digits and " " not in raw.strip(): return "operator_num"
+    if has_alpha: return "name"
+    if len(digits) >= 10: return "phone"
+    if 1 <= len(digits) <= 9: return "id"
+    return "name"
+
+def _u_person_matches(p, phrase_lower, qtype="name"):
+    if not isinstance(p, dict): return False
+    if qtype == "phone":
+        target = _u_normalize_phone(phrase_lower)
+        if not target: return False
+        for k, v in p.items():
+            if isinstance(k, str) and k.startswith("_"): continue
+            if v in (None, "", 0, "0"): continue
+            if not isinstance(v, (str, int)): continue
+            digits = _u_normalize_phone(v)
+            if len(digits) < 7: continue
+            if target in digits: return True
+        return False
+    fields = (
+        _u_pick(p, "surname", "client_surname", "u_surname", "last_name", "fam",
+                "t_surname", "tourist_surname", "familiya"),
+        _u_pick(p, "name", "client_name", "u_name", "first_name", "imya",
+                "t_name", "tourist_name"),
+        _u_pick(p, "middle_name", "client_middle_name", "u_middle_name", "patronymic", "otch"),
+        _u_pick(p, "email", "client_email", "u_email", "t_email"),
+    )
+    for f in fields:
+        if f and phrase_lower in str(f).lower(): return True
+    return False
+
+_U_NOT_LEAD_ID_KEYS = frozenset({
+    "manager_id", "user_id", "u_id", "client_id", "id_client", "id_user",
+    "id_manager", "id_status", "status_id", "id_country", "country_id",
+    "id_region", "region_id", "id_city", "city_id", "id_currency", "currency_id",
+    "tour_operator_id", "id_tour_operator", "operator_id", "id_operator",
+    "id_office", "office_id", "id_source", "source_id",
+})
+
+_U_OPERATOR_NUM_KEYS = (
+    "reservation_number", "tour_operator_number", "touroperator_number",
+    "tour_number", "number_tour", "tour_op_number", "nomer_zayavki",
+    "zayavka_to", "to_number", "n_zayavka", "r_num_tur", "num_tur",
+    "operator_number", "booking_number", "bron_number", "nomer_broni",
+    "code_tour", "tour_code", "r_code",
+)
+
+def _u_operator_num_matches(lead, query):
+    if not isinstance(lead, dict) or not query: return False
+    q = query.strip().lower()
+    for k in _U_OPERATOR_NUM_KEYS:
+        v = lead.get(k)
+        if v and q == str(v).strip().lower(): return True
+    for k, v in lead.items():
+        if not isinstance(v, str) or not v: continue
+        if q == v.strip().lower(): return True
+    return False
+
+def _u_lead_id_matches(lead, query_digits):
+    if not isinstance(lead, dict) or not query_digits: return False
+    for k in ("id", "lead_id", "r_id", "request_id", "lead_number", "number"):
+        v = lead.get(k)
+        if v and str(v).strip() == query_digits: return True
+    for k, v in lead.items():
+        if not isinstance(k, str): continue
+        kl = k.lower()
+        if kl in _U_NOT_LEAD_ID_KEYS: continue
+        if kl in ("id", "lead_id", "r_id", "request_id", "lead_number", "number") \
+           or (kl.endswith("_id") and kl not in _U_NOT_LEAD_ID_KEYS):
+            if v and str(v).strip() == query_digits: return True
+    contract = _u_pick(lead, "contract_number", "number_contract", "contract",
+                       "nomer_dogovora", "dogovor", "n_dogovor")
+    if contract and query_digits in str(contract): return True
+    return False
+
+def _u_lead_tourists(lead):
+    for k in ("tourists", "tourist", "u_tourists", "u_tourist",
+              "travellers", "traveler", "passengers", "members", "participants"):
+        v = lead.get(k)
+        if v: return _u_as_list(v)
+    return []
+
+def _u_parse_date(s):
+    if not s: return None
+    s = str(s).strip()[:10]
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try: return datetime.datetime.strptime(s, fmt).date()
+        except ValueError: pass
+    return None
+
+def _u_lead_fio(lead):
+    surname = _u_pick(lead, "client_surname", "surname", "u_surname")
+    name = _u_pick(lead, "client_name", "name", "u_name")
+    initial = (str(name)[:1] + ".") if name else ""
+    return f"{surname} {initial}".strip()
+
+def _u_fmt_money(v):
+    if v in (None, "", 0, "0", "0.00"): return ""
+    try:
+        f = float(str(v).replace(",", ".").replace(" ", ""))
+        if f == int(f): return f"{int(f):,}".replace(",", " ")
+        return f"{f:,.2f}".replace(",", " ").replace(".", ",")
+    except Exception:
+        return str(v)
+
+async def _u_list_clients_matching(s, phrase_lower, qtype="name"):
+    found = []
+    last_size = None
+    for page in range(1, UON_SCAN_PAGES + 1):
+        data = await _uon_get(s, f"users/{page}.json")
+        if data is None: break
+        items = _u_as_list(data.get("users") or data.get("clients") or data.get("user"))
+        if not items: break
+        for u in items:
+            if _u_person_matches(u, phrase_lower, qtype=qtype): found.append(u)
+        if last_size is not None and len(items) < last_size: break
+        last_size = len(items)
+    return found
+
+async def _u_paged_leads(s, base_path, max_pages=None):
+    leads = []
+    last_size = None
+    limit = max_pages or UON_SCAN_PAGES
+    for page in range(1, limit + 1):
+        data = await _uon_get(s, f"{base_path}/{page}.json")
+        if data is None: break
+        page_leads = _u_as_list(data.get("leads") or data.get("lead") or
+                                data.get("requests") or data.get("request"))
+        if not page_leads: break
+        leads.extend(page_leads)
+        if last_size is not None and len(page_leads) < last_size: break
+        last_size = len(page_leads)
+    return leads
+
+async def _u_scan_for_phrase(s, phrase_lower, qtype="name"):
+    query_digits = _u_digits(phrase_lower) if qtype == "id" else ""
+    max_pages = UON_SCAN_PAGES_DEEP if qtype in ("id", "phone", "operator_num") else UON_SCAN_PAGES
+    found = []
+    base_path = None
+    for candidate in ("lead", "request"):
+        test = await _uon_get(s, f"{candidate}/1.json")
+        if test is not None:
+            items = _u_as_list(test.get("leads") or test.get("lead")
+                               or test.get("requests") or test.get("request"))
+            if items: base_path = candidate; break
+    if base_path is None: return found
+    last_size = None
+    for page in range(1, max_pages + 1):
+        data = await _uon_get(s, f"{base_path}/{page}.json")
+        if data is None: break
+        leads = _u_as_list(data.get("leads") or data.get("lead") or
+                           data.get("requests") or data.get("request"))
+        if not leads: break
+        for ld in leads:
+            matched_tourist = None
+            if qtype == "id":
+                if not _u_lead_id_matches(ld, query_digits): continue
+            elif qtype == "operator_num":
+                if not _u_operator_num_matches(ld, phrase_lower): continue
+            elif _u_person_matches(ld, phrase_lower, qtype=qtype):
+                pass
+            else:
+                tourists = _u_lead_tourists(ld)
+                for t in tourists:
+                    if _u_person_matches(t, phrase_lower, qtype=qtype):
+                        matched_tourist = t; break
+                if matched_tourist is None: continue
+            if matched_tourist is not None:
+                ld["_matched_tourist"] = matched_tourist
+            found.append(ld)
+        if last_size is not None and len(leads) < last_size: break
+        last_size = len(leads)
+    return found
+
+async def _u_get_lead(lead_id):
+    async with aiohttp.ClientSession() as s:
+        for path in (f"lead/{lead_id}.json", f"request/{lead_id}.json"):
+            data = await _uon_get(s, path)
+            if not data: continue
+            lead = data.get("lead") or data.get("request") or data.get("requests")
+            if isinstance(lead, list): return lead[0] if lead else None
+            if isinstance(lead, dict): return lead
+    return None
+
+def fmt_lead_card_vk(lead: dict) -> str:
+    """Карточка заявки в plain text для VK (без HTML, с URL прямой строкой)."""
+    lid = _u_pick(lead, "id", "lead_id", "r_id")
+    fio = " ".join(filter(None, [
+        _u_pick(lead, "client_surname", "surname", "u_surname", "fam"),
+        _u_pick(lead, "client_name", "name", "u_name", "imya"),
+        _u_pick(lead, "client_middle_name", "middle_name", "u_middle_name", "otch"),
+    ])).strip()
+    contract_num = _u_pick(lead, "contract_number", "number_contract", "contract",
+                           "nomer_dogovora", "dogovor", "n_dogovor")
+    contract_date = _u_pick(lead, "contract_date", "date_contract", "data_dogovora")
+    operator = _u_pick(lead, "tour_operator", "operator", "touroperator",
+                       "tour_operator_name", "operator_name", "to_name")
+    operator_num = _u_pick(lead, "reservation_number", "tour_operator_number",
+                           "touroperator_number", "tour_number", "number_tour",
+                           "tour_op_number", "nomer_zayavki", "zayavka_to",
+                           "to_number", "n_zayavka")
+    country = _u_pick(lead, "country", "country_name", "name_country", "strana")
+    region = _u_pick(lead, "region", "region_name", "kurort", "city")
+    date_from = _u_pick(lead, "from_date", "date_from", "departure", "dat_begin",
+                        "data_zaezda", "datebegin", "date_begin")
+    date_to = _u_pick(lead, "to_date", "date_to", "return", "dat_end",
+                      "data_viezda", "dateend", "date_end")
+    nights = _u_pick(lead, "nights", "nochej", "nochey", "n_nights")
+    cost = _u_pick(lead, "cost", "price", "sum", "summa", "total", "total_cost",
+                   "tour_cost", "cost_total")
+    paid = _u_pick(lead, "pay", "paid", "payed", "clean_pay",
+                   "summa_oplacheno", "oplacheno", "summa_pay")
+    remainder = _u_pick(lead, "remainder", "debt", "balance", "ostatok",
+                        "summa_dolg", "dolg", "doplata", "to_pay")
+    if not remainder and cost and paid:
+        try: remainder = float(str(cost).replace(",", ".")) - float(str(paid).replace(",", "."))
+        except Exception: pass
+    status = _u_pick(lead, "status_name", "status", "name_status", "status_text")
+
+    def _fmt_d(v):
+        d = _u_parse_date(v)
+        return d.strftime("%d.%m.%Y") if d else str(v or "")
+
+    mt = lead.get("_matched_tourist") if isinstance(lead, dict) else None
+    matched_tourist_fio = ""
+    if isinstance(mt, dict):
+        matched_tourist_fio = " ".join(filter(None, [
+            _u_pick(mt, "u_surname", "surname", "last_name"),
+            _u_pick(mt, "u_name", "name", "first_name"),
+        ])).strip()
+
+    lines = [f"Заявка #{lid}" if lid else "Заявка"]
+    if fio: lines.append(f"👤 {fio}")
+    if matched_tourist_fio and matched_tourist_fio.lower() != fio.lower():
+        lines.append(f"🧳 Турист: {matched_tourist_fio}")
+    if contract_num:
+        s_line = f"📄 Договор {contract_num}"
+        if contract_date: s_line += f" от {contract_date}"
+        lines.append(s_line)
+    tour_parts = [str(p) for p in (country, region) if p]
+    tour_str = ", ".join(tour_parts)
+    if date_from or date_to:
+        tour_str += f" • {_fmt_d(date_from)}"
+        if date_to: tour_str += f" — {_fmt_d(date_to)}"
+    if nights: tour_str += f" ({nights} н)"
+    tour_str = tour_str.strip(", •")
+    if tour_str: lines.append(f"✈️ {tour_str}")
+    if operator:
+        s_line = f"🏢 {operator}"
+        if operator_num: s_line += f" / бронь {operator_num}"
+        lines.append(s_line)
+    if cost: lines.append(f"💰 Сумма: {_u_fmt_money(cost)} руб")
+    if paid: lines.append(f"✅ Оплачено: {_u_fmt_money(paid)} руб")
+    if remainder and _u_fmt_money(remainder):
+        lines.append(f"❗ Остаток: {_u_fmt_money(remainder)} руб")
+    if status: lines.append(f"📌 Статус: {status}")
+    url = uon_lead_url(lid)
+    if url: lines.append(f"🔗 {url}")
+    return "\n".join(lines)
+
+async def uon_search(query: str) -> list:
+    """Универсальный поиск — авто-классификация запроса. Возвращает список заявок."""
+    qtype = _u_classify(query)
+    phrase_lower = query.lower().strip()
+    all_leads = []
+    seen = set()
+
+    async with aiohttp.ClientSession() as s:
+        if qtype == "operator_num":
+            data = await _uon_post(s, "request/search.json", {"reservation_number": query})
+            if data:
+                items = _u_as_list(data.get("requests") or data.get("request")
+                                   or data.get("leads") or data.get("lead"))
+                for ld in items:
+                    lid = str(_u_pick(ld, "id", "lead_id", "r_id") or "")
+                    if lid and lid not in seen:
+                        seen.add(lid); all_leads.append(ld)
+
+        if qtype == "id":
+            qd = _u_digits(query)
+            for param in ("r_id", "id", "number", "lead_number"):
+                data = await _uon_post(s, "request/search.json", {param: qd})
+                if data:
+                    items = _u_as_list(data.get("requests") or data.get("request")
+                                       or data.get("leads") or data.get("lead"))
+                    for ld in items:
+                        lid = str(_u_pick(ld, "id", "lead_id", "r_id") or "")
+                        if lid != qd: continue
+                        if lid not in seen:
+                            seen.add(lid); all_leads.append(ld)
+                    if all_leads: break
+            if not all_leads:
+                direct = await _u_get_lead(qd)
+                if direct:
+                    lid = str(_u_pick(direct, "id", "lead_id", "r_id") or "")
+                    if lid == qd or not lid:
+                        all_leads.append(direct)
+                        if lid: seen.add(lid)
+            if not all_leads:
+                scanned = await _u_scan_for_phrase(s, qd, qtype="id")
+                for ld in scanned:
+                    lid = str(_u_pick(ld, "id", "lead_id", "r_id") or "")
+                    if lid == qd and lid not in seen:
+                        seen.add(lid); all_leads.append(ld)
+
+        if qtype == "name":
+            clients = await _u_list_clients_matching(s, phrase_lower, qtype="name")
+            for u in clients[:10]:
+                c_id = _u_pick(u, "id", "u_id", "user_id")
+                if not c_id: continue
+                leads = await _u_paged_leads(s, f"request-by-client/{c_id}")
+                for ld in leads:
+                    lid = str(_u_pick(ld, "id", "lead_id") or "")
+                    if lid and lid in seen: continue
+                    if lid: seen.add(lid)
+                    ld["_client"] = u
+                    all_leads.append(ld)
+            # Поиск туристов по фамилии
+            parts = query.strip().split()
+            surname = parts[0] if parts else query
+            payload = {"u_surname": surname}
+            if len(parts) >= 2: payload["u_name"] = parts[1]
+            data = await _uon_post(s, "user/search.json", payload)
+            tourists_found = _u_as_list(data.get("users") if data else None)
+            for u in tourists_found[:10]:
+                c_id = _u_pick(u, "id", "u_id", "user_id")
+                if not c_id: continue
+                leads = await _u_paged_leads(s, f"request-by-client/{c_id}")
+                for ld in leads:
+                    lid = str(_u_pick(ld, "id", "lead_id") or "")
+                    if lid and lid in seen: continue
+                    if lid: seen.add(lid)
+                    ld["_matched_tourist"] = u
+                    all_leads.append(ld)
+
+        if qtype == "phone":
+            norm = _u_normalize_phone(query)
+            data = await _uon_get(s, f"user/phone/{norm}.json")
+            users = _u_as_list(data.get("users") if data else None)
+            data2 = await _uon_post(s, "request/search.json", {"client_phone": query})
+            if data2:
+                items = _u_as_list(data2.get("requests") or data2.get("request")
+                                   or data2.get("leads") or data2.get("lead"))
+                for ld in items:
+                    if not _u_person_matches(ld, phrase_lower, qtype="phone"):
+                        tourists = _u_lead_tourists(ld)
+                        if not any(_u_person_matches(t, phrase_lower, qtype="phone") for t in tourists):
+                            continue
+                    lid = str(_u_pick(ld, "id", "lead_id", "r_id") or "")
+                    if lid and lid not in seen:
+                        seen.add(lid); all_leads.append(ld)
+            for u in users[:10]:
+                c_id = _u_pick(u, "id", "u_id", "user_id")
+                if not c_id: continue
+                leads = await _u_paged_leads(s, f"request-by-client/{c_id}")
+                for ld in leads:
+                    lid = str(_u_pick(ld, "id", "lead_id") or "")
+                    if lid and lid in seen: continue
+                    if lid: seen.add(lid)
+                    all_leads.append(ld)
+
+    return all_leads
+
+async def _u_fetch_all_leads(max_pages=60):
+    leads = []
+    async with aiohttp.ClientSession() as s:
+        base_path = None
+        for candidate in ("lead", "request"):
+            data = await _uon_get(s, f"{candidate}/1.json")
+            if data:
+                items = _u_as_list(data.get("leads") or data.get("lead") or
+                                   data.get("requests") or data.get("request"))
+                if items: base_path = candidate; break
+        if not base_path: return leads
+        last_size = None
+        for page in range(1, max_pages + 1):
+            data = await _uon_get(s, f"{base_path}/{page}.json")
+            if not data: break
+            page_leads = _u_as_list(data.get("leads") or data.get("lead") or
+                                    data.get("requests") or data.get("request"))
+            if not page_leads: break
+            leads.extend(page_leads)
+            if last_size is not None and len(page_leads) < last_size: break
+            last_size = len(page_leads)
+    return leads
+
+def _u_days_label(n):
+    if n == 0: return "сегодня"
+    if n == 1: return "завтра"
+    w = ("день" if n % 10 == 1 and n % 100 != 11 else
+         "дня" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "дней")
+    return f"через {n} {w}"
+
+async def uon_digest_departures():
+    if not uon_configured(): return "U-ON не настроен."
+    today = datetime.date.today()
+    tomorrow = today + datetime.timedelta(days=1)
+    buckets = {today: [], tomorrow: []}
+    leads = await _u_fetch_all_leads()
+    for ld in leads:
+        dep = _u_parse_date(_u_pick(ld, "date_begin", "from_date", "date_from",
+                                    "departure", "dat_begin", "datebegin"))
+        if dep not in buckets: continue
+        fio = _u_lead_fio(ld)
+        country = _u_pick(ld, "country", "country_name", "name_country") or ""
+        lid = _u_pick(ld, "id", "lead_id", "r_id")
+        ref = f"#{lid}" if lid else ""
+        buckets[dep].append(f"• {ref} {fio} — {country}".rstrip(" —").strip())
+    if not any(buckets.values()):
+        return "✈️ Вылетов сегодня и завтра не найдено."
+    parts = []
+    for d, lines in buckets.items():
+        if lines:
+            label = "сегодня" if d == today else "завтра"
+            parts.append(f"✈️ Вылеты {label} ({d.strftime('%d.%m.%Y')})\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+async def uon_digest_returns():
+    if not uon_configured(): return "U-ON не настроен."
+    today = datetime.date.today()
+    tomorrow = today + datetime.timedelta(days=1)
+    buckets = {today: [], tomorrow: []}
+    leads = await _u_fetch_all_leads()
+    for ld in leads:
+        ret = _u_parse_date(_u_pick(ld, "to_date", "date_to", "return", "dat_end",
+                                    "data_viezda", "dateend", "date_end"))
+        if ret not in buckets: continue
+        fio = _u_lead_fio(ld)
+        country = _u_pick(ld, "country", "country_name") or ""
+        lid = _u_pick(ld, "id", "lead_id", "r_id")
+        ref = f"#{lid}" if lid else ""
+        buckets[ret].append(f"• {ref} {fio} — {country}".rstrip(" —").strip())
+    if not any(buckets.values()):
+        return "🛬 Возвращений сегодня и завтра не найдено."
+    parts = []
+    for d, lines in buckets.items():
+        if lines:
+            label = "сегодня" if d == today else "завтра"
+            parts.append(f"🛬 Возвращения {label} ({d.strftime('%d.%m.%Y')})\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+async def uon_digest_deadlines(days_ahead=14):
+    if not uon_configured(): return "U-ON не настроен."
+    today = datetime.date.today()
+    horizon = today + datetime.timedelta(days=days_ahead)
+    deadlines = []
+    leads = await _u_fetch_all_leads()
+    for ld in leads:
+        pay_date = _u_parse_date(_u_pick(ld,
+            "payment_deadline_partner", "payment_deadline_to",
+            "to_pay_date", "operator_pay_date", "date_pay_to",
+            "pay_date_to", "deadline_to", "r_pay_date_to", "pay_to_deadline"))
+        if pay_date and today <= pay_date <= horizon:
+            deadlines.append((pay_date, ld))
+    if not deadlines:
+        return f"📊 Дедлайнов оплаты ТО на ближайшие {days_ahead} дней не найдено."
+    deadlines.sort(key=lambda x: x[0])
+    lines = [f"📊 Дедлайны оплаты ТО (ближайшие {days_ahead} дней)"]
+    for pay_date, ld in deadlines:
+        fio = _u_lead_fio(ld)
+        operator = _u_pick(ld, "tour_operator", "operator", "touroperator") or ""
+        delta = (pay_date - today).days
+        urgency = "❗ " if delta <= 3 else ("⚠️ " if delta <= 7 else "• ")
+        lid = _u_pick(ld, "id", "lead_id", "r_id")
+        ref = f"#{lid}" if lid else ""
+        lines.append(
+            f"{urgency}{ref} {fio} — до {pay_date.strftime('%d.%m')} "
+            f"({_u_days_label(delta)}) {operator}".strip()
+        )
+    return "\n".join(lines)
+
+async def uon_digest_bookings(days=1):
+    if not uon_configured(): return "U-ON не настроен."
+    today = datetime.date.today()
+    since = today - datetime.timedelta(days=days - 1)
+    found = []
+    leads = await _u_fetch_all_leads(max_pages=10)
+    for ld in leads:
+        created = _u_parse_date(_u_pick(ld, "created", "date_create", "create_date",
+                                        "r_dat_create", "dat_create"))
+        if created and created >= since:
+            found.append((created, ld))
+    label = "сегодня" if days == 1 else f"за {days} дн."
+    if not found:
+        return f"📋 Новых заявок {label} не найдено."
+    found.sort(key=lambda x: x[0], reverse=True)
+    lines = [f"📋 Заявки {label} ({len(found)} шт.)"]
+    for created, ld in found[:30]:
+        fio = _u_lead_fio(ld)
+        country = _u_pick(ld, "country", "country_name") or ""
+        lid = _u_pick(ld, "id", "lead_id", "r_id")
+        ref = f"#{lid}" if lid else ""
+        lines.append(f"• {ref} {fio} {country} — {created.strftime('%d.%m')}".rstrip(" —").strip())
+    return "\n".join(lines)
+
+
+# ─── VK-хендлеры U-ON ──────────────────────────────────────────────
+
+@bot.on.message(text="🔎 U-ON")
+async def go_uon(msg: Message):
+    if not allowed(msg.from_id): return
+    clear(msg.from_id)
+    if not uon_configured():
+        await send(msg.peer_id,
+                   "U-ON не настроен. Добавь в Railway → Variables: "
+                   "UON_API_KEY и UON_ACCOUNT_ID.",
+                   kb_orders())
+        return
+    await send(msg.peer_id, "U-ON: что показать?", kb_uon())
+
+@bot.on.message(text="◀ Заказы")
+async def back_orders(msg: Message):
+    if not allowed(msg.from_id): return
+    clear(msg.from_id)
+    await send(msg.peer_id, "Туристы:", kb_orders())
+
+@bot.on.message(text="🔎 Поиск заявки")
+async def uon_start_search(msg: Message):
+    uid = msg.from_id
+    if not allowed(uid): return
+    if not uon_configured():
+        await send(msg.peer_id, "U-ON не настроен.", kb_orders()); return
+    clear(uid)
+    states[uid] = {"sec": "uon", "step": "uon_query"}
+    await send(msg.peer_id,
+               "Введи ФИО, телефон, номер заявки или номер брони ТО — "
+               "сама пойму что это:",
+               kb_cancel())
+
+@bot.on.message(text="📋 Брони сегодня")
+async def uon_bookings_today(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Считаю заявки за сегодня…")
+    try:
+        text = await uon_digest_bookings(days=1)
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_uon())
+
+@bot.on.message(text="✈️ Вылеты")
+async def uon_departures(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Собираю вылеты…")
+    try:
+        text = await uon_digest_departures()
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_uon())
+
+@bot.on.message(text="🛬 Возвращения")
+async def uon_returns(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Собираю возвращения…")
+    try:
+        text = await uon_digest_returns()
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_uon())
+
+@bot.on.message(text="📊 Дедлайны ТО")
+async def uon_deadlines(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Собираю дедлайны ТО на 14 дней…")
+    try:
+        text = await uon_digest_deadlines(days_ahead=14)
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_uon())
+
+
+# ══════════════════════════════════════════════════════════════════
+# КУРС ВАЛЮТ (ЦБ РФ)
+# ══════════════════════════════════════════════════════════════════
+
+async def fetch_cbr_rates():
+    """Курсы ЦБ РФ на сегодня. Источник — публичный JSON cbr-xml-daily.ru."""
+    url = "https://www.cbr-xml-daily.ru/daily_json.js"
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            return await r.json(content_type=None)
+
+@bot.on.message(text="💱 Курс валют")
+async def go_currency(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Тяну курс с ЦБ РФ…")
+    try:
+        data = await fetch_cbr_rates()
+        date_str = data.get("Date", "")[:10]
+        valutes = data.get("Valute", {})
+        # Только самые ходовые для туризма
+        order = ["USD", "EUR", "CNY", "JPY", "GBP", "AED", "TRY", "THB"]
+        lines = [f"💱 Курс ЦБ РФ ({date_str})\n"]
+        for code in order:
+            v = valutes.get(code)
+            if not v: continue
+            nominal = v.get("Nominal", 1)
+            value = v.get("Value", 0)
+            prev = v.get("Previous", 0)
+            arrow = "↑" if value > prev else ("↓" if value < prev else "→")
+            diff = value - prev
+            lines.append(f"{v.get('CharCode')} ({nominal}): {value:.2f} ₽ {arrow} {diff:+.2f}")
+        await send(msg.peer_id, "\n".join(lines), kb_useful())
+    except Exception as e:
+        await send(msg.peer_id, f"Не получилось получить курс: {e}", kb_useful())
 
 
 # ══════════════════════════════════════════════════════════════════
