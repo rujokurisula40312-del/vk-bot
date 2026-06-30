@@ -347,6 +347,12 @@ def kb_useful():
     return kb(["🔐 Пароли", "💱 Курс валют"],
               ["◀ Главная"])
 
+# Подменю «💱 Курс валют» — выбор источника по ТО.
+def kb_currency():
+    return kb(["📊 Tour-kassa (сегодня)", "📊 Tour-kassa (завтра)"],
+              ["🛳 CruClub", "✈️ PAC Group"],
+              ["🚢 Ла Вояж", "◀ Главная"])
+
 def kb_cancel():
     return kb(["❌ Отмена"])
 
@@ -2191,6 +2197,9 @@ async def uon_deadlines(msg: Message):
 # КУРС ВАЛЮТ (ЦБ РФ)
 # ══════════════════════════════════════════════════════════════════
 
+# Курсы туроператоров и ЦБ — все из currency_module (один в один как в TG-боте).
+import currency_module as _curr
+
 async def fetch_cbr_rates():
     """Курсы ЦБ РФ на сегодня. Источник — публичный JSON cbr-xml-daily.ru."""
     url = "https://www.cbr-xml-daily.ru/daily_json.js"
@@ -2199,28 +2208,60 @@ async def fetch_cbr_rates():
             return await r.json(content_type=None)
 
 @bot.on.message(text="💱 Курс валют")
-async def go_currency(msg: Message):
+async def go_currency_menu(msg: Message):
+    """Меню источников курса валют."""
     if not allowed(msg.from_id): return
-    await send(msg.peer_id, "⏳ Тяну курс с ЦБ РФ…")
+    await send(msg.peer_id, "💱 Курс какого ТО?", kb_currency())
+
+@bot.on.message(text="📊 Tour-kassa (сегодня)")
+async def go_currency_tk_today(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Тяну сводную таблицу tour-kassa…")
     try:
-        data = await fetch_cbr_rates()
-        date_str = data.get("Date", "")[:10]
-        valutes = data.get("Valute", {})
-        # Только самые ходовые для туризма
-        order = ["USD", "EUR", "CNY", "JPY", "GBP", "AED", "TRY", "THB"]
-        lines = [f"💱 Курс ЦБ РФ ({date_str})\n"]
-        for code in order:
-            v = valutes.get(code)
-            if not v: continue
-            nominal = v.get("Nominal", 1)
-            value = v.get("Value", 0)
-            prev = v.get("Previous", 0)
-            arrow = "↑" if value > prev else ("↓" if value < prev else "→")
-            diff = value - prev
-            lines.append(f"{v.get('CharCode')} ({nominal}): {value:.2f} ₽ {arrow} {diff:+.2f}")
-        await send(msg.peer_id, "\n".join(lines), kb_useful())
+        text = await _curr.fetch_tour_kassa_rates(tomorrow=False)
     except Exception as e:
-        await send(msg.peer_id, f"Не получилось получить курс: {e}", kb_useful())
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_currency())
+
+@bot.on.message(text="📊 Tour-kassa (завтра)")
+async def go_currency_tk_tomorrow(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Тяну сводную таблицу tour-kassa…")
+    try:
+        text = await _curr.fetch_tour_kassa_rates(tomorrow=True)
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_currency())
+
+@bot.on.message(text="🛳 CruClub")
+async def go_currency_cruclub(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Тяну курс CruClub…")
+    try:
+        text = await _curr.fetch_cruclub_rates()
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_currency())
+
+@bot.on.message(text="✈️ PAC Group")
+async def go_currency_pac(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Тяну курс PAC Group…")
+    try:
+        text = await _curr.fetch_pac_rates()
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_currency())
+
+@bot.on.message(text="🚢 Ла Вояж")
+async def go_currency_lavoyage(msg: Message):
+    if not allowed(msg.from_id): return
+    await send(msg.peer_id, "⏳ Тяну курс Ла Вояж…")
+    try:
+        text = await _curr.fetch_lavoyage_rates()
+    except Exception as e:
+        text = f"Ошибка: {e}"
+    await send(msg.peer_id, text, kb_currency())
 
 
 # ══════════════════════════════════════════════════════════════════
