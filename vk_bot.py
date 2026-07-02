@@ -1106,38 +1106,54 @@ async def handle_all(msg: Message):
         found = []
         errors = 0
         scanned = 0
-        for sp_id in [SP_GUIDES, SP_GUIDES_ALL, SP_GUIDES_CO]:
-            if not sp_id: continue
+        diag = []   # диагностика по каждой таблице
+        slots = [("гиды", SP_GUIDES), ("все", SP_GUIDES_ALL), ("компании", SP_GUIDES_CO)]
+        for label, sp_id in slots:
+            if not sp_id:
+                diag.append(f"{label}: нет ID")
+                continue
             try:
                 sp = sheets_retry(gc.open_by_key, sp_id)
-                # ищем во всех вкладках таблицы, а не только в первой
-                for ws in sheets_retry(sp.worksheets):
+                wss = sheets_retry(sp.worksheets)
+                sheet_rows = 0
+                for ws in wss:
                     try:
                         rows = sheets_retry(ws.get_all_values)
                     except Exception as e:
                         log.error(f"guide_search ws '{ws.title}' failed: {e}")
                         errors += 1
                         continue
-                    scanned += len(rows)
+                    sheet_rows += len(rows)
                     # сканируем все строки (в некоторых вкладках нет строки-заголовка)
                     for r in rows:
                         if any(c.strip() for c in r) and fuzzy(text, " ".join(r)):
                             found.append(r)
+                scanned += sheet_rows
+                diag.append(f"{label}: {len(wss)} вкл, {sheet_rows} стр")
             except Exception as e:
                 log.error(f"guide_search sheet {sp_id} failed: {e}")
                 errors += 1
+                diag.append(f"{label}: ошибка ({type(e).__name__})")
         log.info(f"guide_search '{text}': scanned={scanned} rows, found={len(found)}, errors={errors}")
         if found:
             for r in found[:5]:
                 await send(msg.peer_id, " | ".join(x for x in r[:5] if x))
-            if len(found) > 5:
-                await send(msg.peer_id, f"… и ещё {len(found) - 5}. Уточни запрос.", kb_know())
-            else:
-                await send(msg.peer_id, f"Найдено: {len(found)}.", kb_know())
-        elif errors:
-            await send(msg.peer_id, "⚠️ Ошибка при обращении к базе гидов. Попробуйте позже.", kb_know())
+            tail = f"… и ещё {len(found) - 5}. Уточни запрос." if len(found) > 5 else f"Найдено: {len(found)}."
+            await send(msg.peer_id, tail, kb_know())
         else:
-            await send(msg.peer_id, "Не найдено.", kb_know())
+            # ничего не нашли — показываем, что бот реально видел в таблицах,
+            # чтобы сразу было понятно: пустые таблицы / нет ID / нет доступа / просто нет совпадения
+            report = "🛠 " + "; ".join(diag)
+            if scanned == 0:
+                msg_txt = ("Не найдено. База гидов пустая или недоступна.\n"
+                           "Проверь переменные SPREADSHEET_ID_GUIDES / _GUIDES_ALL / _GUIDES_COMPANIES "
+                           "и доступ сервисного аккаунта Google к таблицам.\n" + report)
+            elif errors:
+                msg_txt = "⚠️ Часть базы недоступна (нет доступа сервисного аккаунта?).\n" + report
+            else:
+                msg_txt = (f"Не найдено. Просканировано строк: {scanned}, "
+                           f"но «{text}» в них нет (проверь написание — возможно, страна записана иначе).\n" + report)
+            await send(msg.peer_id, msg_txt, kb_know())
         states.pop(uid, None)
         return
 
