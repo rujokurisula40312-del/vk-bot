@@ -1099,20 +1099,41 @@ async def handle_all(msg: Message):
     if sec == "guide_search":
         if not text: return
         await send(msg.peer_id, f"🔍 Ищу: {text}...")
+        if not gc:
+            await send(msg.peer_id, "⚠️ Google Sheets не настроен. Обратитесь к администратору.", kb_know())
+            states.pop(uid, None)
+            return
         found = []
+        errors = 0
         for sp_id in [SP_GUIDES, SP_GUIDES_ALL, SP_GUIDES_CO]:
             if not sp_id: continue
             try:
-                rows = sheets_retry(gc.open_by_key, sp_id).sheet1.get_all_values()
-                for r in rows[1:]:
-                    if fuzzy(text, " ".join(r)):
-                        found.append(r)
-            except: pass
-        if not found:
-            await send(msg.peer_id, "Не найдено.", kb_know())
-        else:
+                sp = sheets_retry(gc.open_by_key, sp_id)
+                # ищем во всех вкладках таблицы, а не только в первой
+                for ws in sheets_retry(sp.worksheets):
+                    try:
+                        rows = sheets_retry(ws.get_all_values)
+                    except Exception as e:
+                        log.error(f"guide_search ws '{ws.title}' failed: {e}")
+                        errors += 1
+                        continue
+                    for r in rows[1:]:
+                        if fuzzy(text, " ".join(r)):
+                            found.append(r)
+            except Exception as e:
+                log.error(f"guide_search sheet {sp_id} failed: {e}")
+                errors += 1
+        if found:
             for r in found[:5]:
                 await send(msg.peer_id, " | ".join(x for x in r[:5] if x))
+            if len(found) > 5:
+                await send(msg.peer_id, f"… и ещё {len(found) - 5}. Уточни запрос.", kb_know())
+            else:
+                await send(msg.peer_id, f"Найдено: {len(found)}.", kb_know())
+        elif errors:
+            await send(msg.peer_id, "⚠️ Ошибка при обращении к базе гидов. Попробуйте позже.", kb_know())
+        else:
+            await send(msg.peer_id, "Не найдено.", kb_know())
         states.pop(uid, None)
         return
 
