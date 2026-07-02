@@ -1105,6 +1105,7 @@ async def handle_all(msg: Message):
             return
         found = []
         errors = 0
+        scanned = 0
         for sp_id in [SP_GUIDES, SP_GUIDES_ALL, SP_GUIDES_CO]:
             if not sp_id: continue
             try:
@@ -1117,12 +1118,15 @@ async def handle_all(msg: Message):
                         log.error(f"guide_search ws '{ws.title}' failed: {e}")
                         errors += 1
                         continue
-                    for r in rows[1:]:
-                        if fuzzy(text, " ".join(r)):
+                    scanned += len(rows)
+                    # сканируем все строки (в некоторых вкладках нет строки-заголовка)
+                    for r in rows:
+                        if any(c.strip() for c in r) and fuzzy(text, " ".join(r)):
                             found.append(r)
             except Exception as e:
                 log.error(f"guide_search sheet {sp_id} failed: {e}")
                 errors += 1
+        log.info(f"guide_search '{text}': scanned={scanned} rows, found={len(found)}, errors={errors}")
         if found:
             for r in found[:5]:
                 await send(msg.peer_id, " | ".join(x for x in r[:5] if x))
